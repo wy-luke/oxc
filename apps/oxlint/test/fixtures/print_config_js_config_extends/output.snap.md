@@ -11,7 +11,8 @@
     "import"
   ],
   "categories": {
-    "correctness": "allow"
+    "correctness": "allow",
+    "suspicious": "allow"
   },
   "rules": {
     "import/no-unassigned-import": "deny"

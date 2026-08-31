@@ -609,6 +609,7 @@ impl ConfigStoreBuilder {
             .collect();
 
         oxlintrc.plugins = Some(self.config.plugins);
+        oxlintrc.categories.clone_from(&self.categories);
         oxlintrc.settings.clone_from(&self.config.settings);
         oxlintrc.env.clone_from(&self.config.env);
         oxlintrc.globals.clone_from(&self.config.globals);
@@ -1669,6 +1670,38 @@ mod test {
             r#"{ "extends": ["fixtures/extends_config/options/max_warnings_0.json"] }"#,
         );
         assert_eq!(config.base.config.options.max_warnings, Some(0));
+    }
+
+    #[test]
+    fn test_print_config_includes_extended_categories() {
+        let oxlintrc: Oxlintrc = serde_json::from_str(
+            r#"
+            {
+                "extends": ["fixtures/extends_config/categories.json"],
+                "categories": { "correctness": "off" }
+            }
+            "#,
+        )
+        .unwrap();
+        let builder = {
+            let mut external_plugin_store = ExternalPluginStore::default();
+            ConfigStoreBuilder::from_oxlintrc(
+                false,
+                oxlintrc.clone(),
+                None,
+                &mut external_plugin_store,
+                None,
+            )
+            .unwrap()
+        };
+
+        let printed: serde_json::Value =
+            serde_json::from_str(&builder.resolve_final_config_file(oxlintrc)).unwrap();
+
+        assert_eq!(
+            printed["categories"],
+            serde_json::json!({ "correctness": "allow", "suspicious": "deny" })
+        );
     }
 
     #[test]
