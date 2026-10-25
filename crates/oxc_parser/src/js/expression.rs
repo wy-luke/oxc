@@ -1,3 +1,5 @@
+use std::num::NonZeroU32;
+
 use cow_utils::CowUtils;
 use oxc_allocator::{ArenaBox, ArenaVec, GetAllocator, ReplaceWith};
 use oxc_ast::ast::*;
@@ -83,6 +85,9 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         // allow `await` and `yield`, let semantic analysis report error
         let kind = self.cur_kind();
         if !kind.is_identifier_reference(false, false) {
+            if self.cur_token().escaped() && matches!(kind, Kind::In | Kind::Instanceof) {
+                return self.fatal_error(diagnostics::escaped_keyword(self.cur_token().span()));
+            }
             return self.unexpected();
         }
         // Track await identifier for potential reparsing in unambiguous mode
@@ -272,8 +277,8 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         let start = self.cur_start();
         let opening_span = self.cur_token().span();
         // Capture annotation flags before bumping `(` since bump resets them
-        let has_no_side_effects_comment =
-            self.lexer.trivia_builder.previous_token_has_no_side_effects_comment();
+        let no_side_effects_comments =
+            self.lexer.trivia_builder.previous_token_no_side_effects_comments();
         self.bump_any(); // `bump` `(`
         let expr_start = self.cur_start();
         let (mut expressions, comma_start) = self.context(Context::In, Context::Decorator, |p| {
@@ -312,14 +317,16 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         match &mut expression {
             Expression::ArrowFunctionExpression(arrow_expr) => {
                 arrow_expr.pife = true;
-                if has_no_side_effects_comment {
+                if let Some(comments) = no_side_effects_comments {
                     arrow_expr.pure = true;
+                    self.lexer.trivia_builder.mark_no_side_effects_comments_applied(comments);
                 }
             }
             Expression::FunctionExpression(func_expr) => {
                 func_expr.pife = true;
-                if has_no_side_effects_comment {
+                if let Some(comments) = no_side_effects_comments {
                     func_expr.pure = true;
+                    self.lexer.trivia_builder.mark_no_side_effects_comments_applied(comments);
                 }
             }
             _ => {}
@@ -499,10 +506,9 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         }
         let span = self.cur_token().span();
         let raw = Str::from(self.cur_src());
-        let value = self.cur_string();
-        let lone_surrogates = self.cur_token().lone_surrogates();
+        let value = self.cur_js_string();
         self.bump_any();
-        StringLiteral::new_with_lone_surrogates(span, value, Some(raw), lone_surrogates, self)
+        StringLiteral::new(span, value, Some(raw), self)
     }
 
     /// Section [Array Expression](https://tc39.es/ecma262/#prod-ArrayLiteral)
@@ -629,7 +635,6 @@ impl<'a, C: Config> ParserImpl<'a, C> {
             _ => unreachable!(),
         };
 
-        // Get `raw`
         let raw_span = self.cur_token().span();
         let mut raw = Str::from(
             &self.source_text[raw_span.start as usize + 1..(raw_span.end - end_offset) as usize],
@@ -639,16 +644,16 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         // Also replace `\r` with `\n` in `raw`.
         // If contains `\r`, then `escaped` must be `true` (because `\r` needs unescaping),
         // so we can skip searching for `\r` in common case where contains no escapes.
-        let (cooked, lone_surrogates) = if self.cur_token().escaped() {
+        let cooked = if self.cur_token().escaped() {
             // `cooked = None` when template literal has invalid escape sequence
-            let cooked = self.cur_template_string().map(Str::from);
+            let cooked = self.cur_template_string();
             if cooked.is_some() && raw.contains('\r') {
                 raw =
                     Str::from_str_in(&raw.cow_replace("\r\n", "\n").cow_replace('\r', "\n"), self);
             }
-            (cooked, self.cur_token().lone_surrogates())
+            cooked
         } else {
-            (Some(raw), false)
+            Some(raw.into())
         };
 
         self.bump_any();
@@ -663,13 +668,7 @@ impl<'a, C: Config> ParserImpl<'a, C> {
 
         let tail = matches!(cur_kind, Kind::TemplateTail | Kind::NoSubstitutionTemplate);
         // Parser provides already-escaped values from source, so no escaping needed here
-        TemplateElement::new_with_lone_surrogates(
-            span,
-            TemplateElementValue { raw, cooked },
-            tail,
-            lone_surrogates,
-            self,
-        )
+        TemplateElement::new(span, TemplateElementValue { raw, cooked }, tail, self)
     }
 
     /// Section 13.3 ImportCall or ImportMeta
@@ -788,10 +787,8 @@ impl<'a, C: Config> ParserImpl<'a, C> {
     ) -> Expression<'a> {
         let pure_comments = self.lexer.trivia_builder.previous_token_pure_comments();
         let mut expr = parse(self);
-        if let Some(comments) = pure_comments
-            && Self::set_pure_on_call_or_new_expr(&mut expr)
-        {
-            self.lexer.trivia_builder.mark_pure_comments_applied(comments);
+        if let Some(comments) = pure_comments {
+            self.apply_pure_comments_to_call(comments, &mut expr);
         }
         expr
     }
@@ -924,9 +921,9 @@ impl<'a, C: Config> ParserImpl<'a, C> {
                             self,
                         );
                     } else {
-                        // `re_lex_as_typescript_l_angle` may have popped the original token
-                        // (e.g. `<<`) from the collected token stream. Rewind restored the
-                        // parser's current token, so write it back to the stream.
+                        // `re_lex_as_typescript_l_angle` may have overwritten the original `<<`
+                        // in the collected token stream with the single `<` it re-lexed.
+                        // Rewind restored the parser's current token, so write it back over that `<`.
                         // This is a no-op when tokens are statically disabled (`NoTokensLexerConfig`).
                         self.lexer.rewrite_last_collected_token(self.token);
                         return lhs;
@@ -1125,9 +1122,9 @@ impl<'a, C: Config> ParserImpl<'a, C> {
                     if let Some(args) = self.parse_type_arguments_in_expression() {
                         type_arguments = Some(args);
                     } else {
-                        // `re_lex_as_typescript_l_angle` may have popped the original token
-                        // (e.g. `<<`) from the collected token stream. Rewind restored the
-                        // parser's current token, so write it back to the stream.
+                        // `re_lex_as_typescript_l_angle` may have overwritten the original `<<`
+                        // in the collected token stream with the single `<` it re-lexed.
+                        // Rewind restored the parser's current token, so write it back over that `<`.
                         // This is a no-op when tokens are statically disabled (`NoTokensLexerConfig`).
                         self.lexer.rewrite_last_collected_token(self.token);
                     }
@@ -1356,6 +1353,13 @@ impl<'a, C: Config> ParserImpl<'a, C> {
                 break;
             }
 
+            if matches!(kind, Kind::In | Kind::Instanceof)
+                && self.cur_token().escaped()
+                && self.cur_token().is_on_new_line()
+            {
+                break;
+            }
+
             if matches!(kind, Kind::As | Kind::Satisfies) {
                 if self.cur_token().is_on_new_line() {
                     break;
@@ -1389,7 +1393,7 @@ impl<'a, C: Config> ParserImpl<'a, C> {
             }
 
             self.bump_any(); // bump operator
-            let rhs_parenthesized = self.at(Kind::LParen);
+            let rhs_start = self.cur_start();
             let rhs = self.parse_binary_expression_or_higher(left_precedence);
 
             lhs = if kind.is_logical_operator() {
@@ -1397,18 +1401,13 @@ impl<'a, C: Config> ParserImpl<'a, C> {
                 let op = map_logical_operator(kind);
                 // check mixed coalesce
                 if op == LogicalOperator::Coalesce {
-                    let mut maybe_mixed_coalesce_expr = None;
-                    if let Expression::LogicalExpression(rhs) = &rhs {
-                        if !rhs_parenthesized {
-                            maybe_mixed_coalesce_expr = Some(rhs);
-                        }
-                    } else if let Expression::LogicalExpression(lhs) = &lhs
-                        && !lhs_parenthesized
-                    {
-                        maybe_mixed_coalesce_expr = Some(lhs);
-                    }
-                    if let Some(expr) = maybe_mixed_coalesce_expr
-                        && matches!(expr.operator, LogicalOperator::And | LogicalOperator::Or)
+                    let is_unparenthesized_logical = |expr: &Expression<'a>, start: u32| {
+                        matches!(expr, Expression::LogicalExpression(expr)
+                            if expr.span.start == start
+                                && matches!(expr.operator, LogicalOperator::And | LogicalOperator::Or))
+                    };
+                    if is_unparenthesized_logical(&lhs, lhs_start)
+                        || is_unparenthesized_logical(&rhs, rhs_start)
                     {
                         self.error(diagnostics::mixed_coalesce(span));
                     }
@@ -1489,8 +1488,8 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         &mut self,
         allow_return_type_in_arrow_function: bool,
     ) -> Expression<'a> {
-        let has_no_side_effects_comment =
-            self.lexer.trivia_builder.previous_token_has_no_side_effects_comment();
+        let no_side_effects_comments =
+            self.lexer.trivia_builder.previous_token_no_side_effects_comments();
         // [+Yield] YieldExpression
         if self.is_yield_expression() {
             return self.parse_yield_expression();
@@ -1499,10 +1498,11 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         if let Some(mut arrow_expr) = self
             .try_parse_parenthesized_arrow_function_expression(allow_return_type_in_arrow_function)
         {
-            if has_no_side_effects_comment
+            if let Some(comments) = no_side_effects_comments
                 && let Expression::ArrowFunctionExpression(func) = &mut arrow_expr
             {
                 func.pure = true;
+                self.lexer.trivia_builder.mark_no_side_effects_comments_applied(comments);
             }
             return arrow_expr;
         }
@@ -1510,10 +1510,11 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         if let Some(mut arrow_expr) = self
             .try_parse_async_simple_arrow_function_expression(allow_return_type_in_arrow_function)
         {
-            if has_no_side_effects_comment
+            if let Some(comments) = no_side_effects_comments
                 && let Expression::ArrowFunctionExpression(func) = &mut arrow_expr
             {
                 func.pure = true;
+                self.lexer.trivia_builder.mark_no_side_effects_comments_applied(comments);
             }
             return arrow_expr;
         }
@@ -1534,10 +1535,11 @@ impl<'a, C: Config> ParserImpl<'a, C> {
                 /* async */ false,
                 allow_return_type_in_arrow_function,
             );
-            if has_no_side_effects_comment
+            if let Some(comments) = no_side_effects_comments
                 && let Expression::ArrowFunctionExpression(func) = &mut arrow_expr
             {
                 func.pure = true;
+                self.lexer.trivia_builder.mark_no_side_effects_comments_applied(comments);
             }
             return arrow_expr;
         }
@@ -1554,15 +1556,39 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         let mut expr =
             self.parse_conditional_expression_rest(start, lhs, allow_return_type_in_arrow_function);
 
-        if has_no_side_effects_comment {
-            Self::set_pure_on_function_expr(&mut expr);
+        if let Some(comments) = no_side_effects_comments {
+            self.apply_no_side_effects_comments_to_function(comments, &mut expr);
         }
 
         expr
     }
 
+    #[cold]
+    #[inline(never)]
+    fn apply_pure_comments_to_call(
+        &mut self,
+        comments: (u32, NonZeroU32),
+        expr: &mut Expression<'a>,
+    ) {
+        if Self::set_pure_on_call_or_new_expr(expr) {
+            self.lexer.trivia_builder.mark_pure_comments_applied(comments);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn apply_no_side_effects_comments_to_function(
+        &mut self,
+        comments: (u32, NonZeroU32),
+        expr: &mut Expression<'a>,
+    ) {
+        if Self::set_pure_on_function_expr(expr) {
+            self.lexer.trivia_builder.mark_no_side_effects_comments_applied(comments);
+        }
+    }
+
     fn set_pure_on_call_or_new_expr(expr: &mut Expression<'a>) -> bool {
-        match &mut expr.get_inner_expression_mut() {
+        match expr.get_inner_expression_mut() {
             Expression::CallExpression(call_expr) => {
                 call_expr.pure = true;
                 true
@@ -1592,15 +1618,17 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         }
     }
 
-    pub(crate) fn set_pure_on_function_expr(expr: &mut Expression<'a>) {
+    pub(crate) fn set_pure_on_function_expr(expr: &mut Expression<'a>) -> bool {
         match expr {
             Expression::FunctionExpression(func) => {
                 func.pure = true;
+                true
             }
             Expression::ArrowFunctionExpression(func) => {
                 func.pure = true;
+                true
             }
-            _ => {}
+            _ => false,
         }
     }
 
@@ -1660,7 +1688,7 @@ impl<'a, C: Config> ParserImpl<'a, C> {
     /// Returns `true` when await is definitely an await expression (not ambiguous).
     ///
     /// Unambiguous cases (returns `true`):
-    /// - Next token is identifier, keyword (except `of`), or literal on same line
+    /// - Next token is identifier, keyword, or literal on same line, except the cases below
     ///
     /// Ambiguous cases (returns `false`):
     /// - Line break after `await` (could be ASI)
@@ -1668,6 +1696,7 @@ impl<'a, C: Config> ParserImpl<'a, C> {
     /// - Next token is `(` `[` (could be call/member or grouping/array)
     /// - Next token is template literal
     /// - Next token is `of` (for-await-of ambiguity: `for (await of [])`)
+    /// - Next tokens form an `await using` declaration
     /// - Next token is `/` (division or regex literal)
     /// - Next token cannot start an expression (`)`, `}`, `;`, etc.)
     fn is_unambiguous_await(&mut self) -> bool {
@@ -1681,8 +1710,12 @@ impl<'a, C: Config> ParserImpl<'a, C> {
         let kind = token.kind();
 
         // Special case: `await of` is ambiguous (for-await-of loop)
-        // Special case: `await using` should be handled as a declaration, not `await (using)`
-        if matches!(kind, Kind::Of | Kind::Using) {
+        if kind == Kind::Of {
+            return false;
+        }
+
+        // Only reserve `await using` for a declaration when a binding identifier follows.
+        if kind == Kind::Using && self.is_using_statement() {
             return false;
         }
 

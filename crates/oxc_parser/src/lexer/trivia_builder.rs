@@ -1,4 +1,7 @@
+use std::num::NonZeroU32;
+
 use memchr::memchr_iter;
+
 use oxc_allocator::{Allocator, ArenaVec};
 use oxc_ast::ast::{Comment, CommentContent, CommentKind, CommentPosition};
 use oxc_span::Span;
@@ -30,10 +33,18 @@ pub struct TriviaBuilder<'a> {
     previous_token: Token,
 
     /// Range of comments preceding the current token that contains pure comments.
-    pure_comments: Option<(usize, usize)>,
+    ///
+    /// `(start, end)` indexes into `comments`, with `end` exclusive.
+    /// `end` is always at least `start + 1`, so it is a `NonZeroU32`.
+    /// That gives the `Option` a niche, so the field is 8 bytes.
+    pure_comments: Option<(u32, NonZeroU32)>,
 
-    pub(super) has_no_side_effects_comment: bool,
+    /// Range of comments preceding the current token that contains no-side-effects comments.
+    /// Same representation as `pure_comments`.
+    no_side_effects_comments: Option<(u32, NonZeroU32)>,
 }
+
+const _: () = assert!(size_of::<Option<(u32, NonZeroU32)>>() == 8);
 
 impl<'a> TriviaBuilder<'a> {
     pub fn new_in(allocator: &'a Allocator) -> Self {
@@ -47,19 +58,19 @@ impl<'a> TriviaBuilder<'a> {
             saw_newline_for_comment: true,
             previous_token,
             pure_comments: None,
-            has_no_side_effects_comment: false,
+            no_side_effects_comments: None,
         }
     }
 
-    pub fn previous_token_pure_comments(&self) -> Option<(usize, usize)> {
+    pub fn previous_token_pure_comments(&self) -> Option<(u32, NonZeroU32)> {
         self.pure_comments
     }
 
-    pub fn previous_token_has_no_side_effects_comment(&self) -> bool {
-        self.has_no_side_effects_comment
+    pub fn previous_token_no_side_effects_comments(&self) -> Option<(u32, NonZeroU32)> {
+        self.no_side_effects_comments
     }
 
-    pub(super) fn set_pure_comments(&mut self, pure_comments: Option<(usize, usize)>) {
+    pub(super) fn set_pure_comments(&mut self, pure_comments: Option<(u32, NonZeroU32)>) {
         self.pure_comments = pure_comments;
     }
 
@@ -67,10 +78,26 @@ impl<'a> TriviaBuilder<'a> {
         self.pure_comments = None;
     }
 
-    pub fn mark_pure_comments_applied(&mut self, (start, end): (usize, usize)) {
-        for comment in &mut self.comments[start..end] {
+    pub(super) fn set_no_side_effects_comments(&mut self, comments: Option<(u32, NonZeroU32)>) {
+        self.no_side_effects_comments = comments;
+    }
+
+    pub(super) fn clear_no_side_effects_comments(&mut self) {
+        self.no_side_effects_comments = None;
+    }
+
+    pub fn mark_pure_comments_applied(&mut self, (start, end): (u32, NonZeroU32)) {
+        for comment in &mut self.comments[start as usize..end.get() as usize] {
             if comment.content == CommentContent::PureNotApplied {
                 comment.content = CommentContent::Pure;
+            }
+        }
+    }
+
+    pub fn mark_no_side_effects_comments_applied(&mut self, (start, end): (u32, NonZeroU32)) {
+        for comment in &mut self.comments[start as usize..end.get() as usize] {
+            if comment.content == CommentContent::NoSideEffectsNotApplied {
+                comment.content = CommentContent::NoSideEffects;
             }
         }
     }
@@ -87,8 +114,8 @@ impl<'a> TriviaBuilder<'a> {
         self.irregular_whitespaces.push(Span::new(start, end));
     }
 
-    pub fn add_line_comment(&mut self, start: u32, end: u32, source_text: &str) {
-        self.add_comment(Comment::new(start, end, CommentKind::Line), source_text);
+    pub fn add_line_comment(&mut self, start: u32, end: u32, kind: CommentKind, source_text: &str) {
+        self.add_comment(Comment::new(start, end, kind), source_text);
     }
 
     pub fn add_block_comment(
@@ -249,20 +276,28 @@ impl<'a> TriviaBuilder<'a> {
                 | CommentContent::Pure
                 | CommentContent::PureNotApplied
                 | CommentContent::NoSideEffects
+                | CommentContent::NoSideEffectsNotApplied
                 | CommentContent::PropertyKey
         )
     }
 
     /// Update annotation state for the comment at `index`.
     fn set_annotation_flags(&mut self, comment: &Comment, index: usize) {
-        if comment.content == CommentContent::PureNotApplied {
-            if let Some((_, end)) = &mut self.pure_comments {
-                *end = index + 1;
-            } else {
-                self.pure_comments = Some((index, index + 1));
-            }
-        } else if comment.is_no_side_effects() {
-            self.has_no_side_effects_comment = true;
+        let range = match comment.content {
+            CommentContent::PureNotApplied => &mut self.pure_comments,
+            CommentContent::NoSideEffectsNotApplied => &mut self.no_side_effects_comments,
+            _ => return,
+        };
+
+        // Comment count cannot exceed `u32::MAX` because of `MAX_LEN` check in `Source::new`,
+        // so `index + 1` cannot overflow, and is never zero
+        #[expect(clippy::cast_possible_truncation)]
+        let index = index as u32;
+        let end = NonZeroU32::new(index + 1).unwrap();
+        if let Some((_, range_end)) = range {
+            *range_end = end;
+        } else {
+            *range = Some((index, end));
         }
     }
 
@@ -445,7 +480,7 @@ impl<'a> TriviaBuilder<'a> {
                 comment.content = CommentContent::PureNotApplied;
                 return;
             } else if rest.starts_with(b"NO_SIDE_EFFECTS__") {
-                comment.content = CommentContent::NoSideEffects;
+                comment.content = CommentContent::NoSideEffectsNotApplied;
                 return;
             }
         }
@@ -515,9 +550,15 @@ fn is_coverage_ignore_file(source: &[u8]) -> bool {
 
 #[cfg(test)]
 mod test {
+    use std::cell::Cell;
+
     use oxc_allocator::Allocator;
-    use oxc_ast::{Comment, CommentContent, CommentKind, CommentPosition, ast::CommentNewlines};
+    use oxc_ast::{
+        Comment, CommentContent, CommentKind, CommentPlacement, CommentPosition,
+        ast::CommentNewlines,
+    };
     use oxc_span::{SourceType, Span};
+    use oxc_syntax::node::NodeId;
 
     use crate::Parser;
 
@@ -526,7 +567,7 @@ mod test {
         let source_type = SourceType::default();
         let ret = Parser::new(&allocator, source_text, source_type).parse();
         assert!(ret.diagnostics.is_empty());
-        ret.program.comments.iter().copied().collect::<Vec<_>>()
+        ret.program.comments.into_iter().collect::<Vec<_>>()
     }
 
     fn get_comments_typescript(source_text: &str) -> Vec<Comment> {
@@ -534,7 +575,7 @@ mod test {
         let source_type = SourceType::default().with_typescript(true);
         let ret = Parser::new(&allocator, source_text, source_type).parse();
         assert!(ret.diagnostics.is_empty());
-        ret.program.comments.iter().copied().collect::<Vec<_>>()
+        ret.program.comments.into_iter().collect::<Vec<_>>()
     }
 
     #[test]
@@ -554,6 +595,8 @@ mod test {
                 attached_to: 70,
                 newlines: CommentNewlines::Leading | CommentNewlines::Trailing,
                 content: CommentContent::None,
+                node_id: Cell::new(NodeId::DUMMY),
+                placement: CommentPlacement::Leading,
             },
             Comment {
                 span: Span::new(33, 45),
@@ -562,6 +605,8 @@ mod test {
                 attached_to: 70,
                 newlines: CommentNewlines::Leading | CommentNewlines::Trailing,
                 content: CommentContent::None,
+                node_id: Cell::new(NodeId::DUMMY),
+                placement: CommentPlacement::Leading,
             },
             Comment {
                 span: Span::new(54, 69),
@@ -570,6 +615,8 @@ mod test {
                 attached_to: 70,
                 newlines: CommentNewlines::Leading,
                 content: CommentContent::None,
+                node_id: Cell::new(NodeId::DUMMY),
+                placement: CommentPlacement::Leading,
             },
             Comment {
                 span: Span::new(76, 92),
@@ -578,6 +625,8 @@ mod test {
                 attached_to: 75,
                 newlines: CommentNewlines::None,
                 content: CommentContent::None,
+                node_id: Cell::new(NodeId::DUMMY),
+                placement: CommentPlacement::Leading,
             },
             Comment {
                 span: Span::new(93, 106),
@@ -586,6 +635,8 @@ mod test {
                 attached_to: 75,
                 newlines: CommentNewlines::Trailing,
                 content: CommentContent::None,
+                node_id: Cell::new(NodeId::DUMMY),
+                placement: CommentPlacement::Leading,
             },
             Comment {
                 span: Span::new(115, 138),
@@ -594,11 +645,13 @@ mod test {
                 attached_to: 147,
                 newlines: CommentNewlines::Leading | CommentNewlines::Trailing,
                 content: CommentContent::None,
+                node_id: Cell::new(NodeId::DUMMY),
+                placement: CommentPlacement::Leading,
             },
         ];
 
         assert_eq!(comments.len(), expected.len());
-        for (comment, expected) in comments.iter().copied().zip(expected) {
+        for (comment, expected) in comments.iter().zip(&expected) {
             assert_eq!(comment, expected, "{}", comment.content_span().source_text(source_text));
         }
     }
@@ -618,6 +671,8 @@ token /* Trailing 1 */
                 attached_to: 36,
                 newlines: CommentNewlines::Leading | CommentNewlines::Trailing,
                 content: CommentContent::None,
+                node_id: Cell::new(NodeId::DUMMY),
+                placement: CommentPlacement::Leading,
             },
             Comment {
                 span: Span::new(42, 58),
@@ -626,9 +681,26 @@ token /* Trailing 1 */
                 attached_to: 41,
                 newlines: CommentNewlines::Trailing,
                 content: CommentContent::None,
+                node_id: Cell::new(NodeId::DUMMY),
+                placement: CommentPlacement::Leading,
             },
         ];
         assert_eq!(comments, expected);
+    }
+
+    #[test]
+    fn html_comment_content() {
+        let allocator = Allocator::default();
+        let source = "<!--a\n-->\n<!--";
+        let ret = Parser::new(&allocator, source, SourceType::script()).parse();
+        assert!(ret.diagnostics.is_empty());
+        assert_eq!(ret.program.comments.len(), 3);
+        let expected = [(Span::new(0, 5), "a"), (Span::new(6, 9), ""), (Span::new(10, 14), "")];
+        for (comment, (span, content)) in ret.program.comments.iter().zip(expected) {
+            assert!(comment.is_line());
+            assert_eq!(comment.span, span);
+            assert_eq!(comment.content_span().source_text(source), content);
+        }
     }
 
     #[test]
@@ -714,6 +786,8 @@ token /* Trailing 1 */
                 attached_to: 28,
                 newlines: CommentNewlines::Leading | CommentNewlines::Trailing,
                 content: CommentContent::None,
+                node_id: Cell::new(NodeId::DUMMY),
+                placement: CommentPlacement::Leading,
             },
             Comment {
                 span: Span::new(14, 26),
@@ -722,6 +796,8 @@ token /* Trailing 1 */
                 attached_to: 28,
                 newlines: CommentNewlines::Leading | CommentNewlines::Trailing,
                 content: CommentContent::None,
+                node_id: Cell::new(NodeId::DUMMY),
+                placement: CommentPlacement::Leading,
             },
         ];
         assert_eq!(comments, expected);
@@ -834,6 +910,8 @@ function bar() {}";
                 attached_to: 57,
                 newlines: CommentNewlines::Trailing,
                 content: CommentContent::None,
+                node_id: Cell::new(NodeId::DUMMY),
+                placement: CommentPlacement::Leading,
             },
             Comment {
                 span: Span::new(96, 116),
@@ -842,6 +920,8 @@ function bar() {}";
                 attached_to: 129,
                 newlines: CommentNewlines::Trailing,
                 content: CommentContent::None,
+                node_id: Cell::new(NodeId::DUMMY),
+                placement: CommentPlacement::Leading,
             },
         ];
         assert_eq!(comments, expected);
@@ -864,6 +944,8 @@ function bar() {}";
                 attached_to: 55,
                 newlines: CommentNewlines::Trailing,
                 content: CommentContent::None,
+                node_id: Cell::new(NodeId::DUMMY),
+                placement: CommentPlacement::Leading,
             },
             Comment {
                 span: Span::new(79, 99),
@@ -872,6 +954,8 @@ function bar() {}";
                 attached_to: 116,
                 newlines: CommentNewlines::Trailing,
                 content: CommentContent::None,
+                node_id: Cell::new(NodeId::DUMMY),
+                placement: CommentPlacement::Leading,
             },
         ];
         assert_eq!(comments, expected);
@@ -890,12 +974,14 @@ function bar() {}";
             attached_to: 34,
             newlines: CommentNewlines::Trailing,
             content: CommentContent::None,
+            node_id: Cell::new(NodeId::DUMMY),
+            placement: CommentPlacement::Leading,
         }];
         assert_eq!(comments, expected);
     }
 
     #[test]
-    fn pure_comment_not_applied() {
+    fn pure_comments_not_applied() {
         let cases = [
             "/* #__PURE__ */ React.createElement;",
             "/* @__PURE__ */ someVariable;",
@@ -1005,16 +1091,98 @@ function bar() {}";
     }
 
     #[test]
-    fn pure_comments_are_applied_independently() {
+    fn annotation_comments_track_application_independently() {
         // The first pure comment is invalid (before `foo`), the second is valid (before `bar()`).
         let source_text = "/*#__PURE__*/ foo + /*#__PURE__*/ bar()";
         let comments = get_comments(source_text);
-        assert_eq!(
-            comments[0].content,
-            CommentContent::PureNotApplied,
-            "first comment should be PureNotApplied"
+
+        assert_eq!(comments.len(), 2, "{source_text}");
+        assert_eq!(comments[0].content, CommentContent::PureNotApplied, "{source_text}");
+        assert_eq!(comments[1].content, CommentContent::Pure, "{source_text}");
+        let source_text = concat!(
+            "/*#__NO_SIDE_EFFECTS__*/ value;",
+            "/*#__NO_SIDE_EFFECTS__*/ /* comment */ /*@__NO_SIDE_EFFECTS__*/ function foo() {}",
         );
-        assert_eq!(comments[1].content, CommentContent::Pure, "second comment should remain Pure");
+        let comments = get_comments(source_text);
+        assert_eq!(comments.len(), 4);
+        assert_eq!(comments[0].content, CommentContent::NoSideEffectsNotApplied,);
+        assert_eq!(comments[1].content, CommentContent::NoSideEffects);
+        assert_eq!(comments[2].content, CommentContent::None);
+        assert_eq!(comments[3].content, CommentContent::NoSideEffects);
+    }
+
+    #[test]
+    fn no_side_effects_comments_not_applied() {
+        let cases = [
+            "/* #__NO_SIDE_EFFECTS__ */",
+            "/* @__NO_SIDE_EFFECTS__ */ assert.ok(true);",
+            "/* #__NO_SIDE_EFFECTS__ */ const foo = 1, bar = () => {};",
+            "/* #__NO_SIDE_EFFECTS__ */ class Foo {}",
+            "/* #__NO_SIDE_EFFECTS__ */ let foo = () => {};",
+            "/* #__NO_SIDE_EFFECTS__ */ var foo = function() {};",
+            "const foo /* #__NO_SIDE_EFFECTS__ */ = () => {};",
+            "export /* #__NO_SIDE_EFFECTS__ */ class Foo {}",
+            "export /* #__NO_SIDE_EFFECTS__ */ let foo = () => {};",
+            "export /* #__NO_SIDE_EFFECTS__ */ var foo = function() {};",
+            "export /* #__NO_SIDE_EFFECTS__ */ const foo = 1, bar = () => {};",
+        ];
+        for source_text in cases {
+            let comments = get_comments(source_text);
+            assert_eq!(
+                comments[0].content,
+                CommentContent::NoSideEffectsNotApplied,
+                "{source_text}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_side_effects_comment_applied() {
+        let cases = [
+            "/* #__NO_SIDE_EFFECTS__ */ function foo() {}",
+            "/* #__NO_SIDE_EFFECTS__ */ async function foo() {}",
+            "/* #__NO_SIDE_EFFECTS__ */ export function foo() {}",
+            "export /*@__NO_SIDE_EFFECTS__*/ function foo() {}",
+            "export /* #__NO_SIDE_EFFECTS__ */ async function foo() {}",
+            "export /* #__NO_SIDE_EFFECTS__ */ function* foo() {}",
+            "export /* #__NO_SIDE_EFFECTS__ */ async function* foo() {}",
+            "export /* #__NO_SIDE_EFFECTS__ */ default function foo() {}",
+            "export default /* #__NO_SIDE_EFFECTS__ */ function foo() {}",
+            "const foo = /* #__NO_SIDE_EFFECTS__ */ function() {};",
+            "const foo = /* #__NO_SIDE_EFFECTS__ */ () => {};",
+            "/* #__NO_SIDE_EFFECTS__ */ const foo = () => {};",
+            "/* #__NO_SIDE_EFFECTS__ */ export const foo = () => {};",
+            "export /* #__NO_SIDE_EFFECTS__ */ const foo = () => {};",
+            "export /* #__NO_SIDE_EFFECTS__ */ const foo = function() {};",
+            "[/* #__NO_SIDE_EFFECTS__ */ function() {}];",
+        ];
+        for source_text in cases {
+            let comments = get_comments(source_text);
+            assert_eq!(comments[0].content, CommentContent::NoSideEffects, "{source_text}");
+        }
+    }
+
+    #[test]
+    fn block_comment_line_terminators() {
+        for (separator, kind) in [
+            ("\u{2028}", CommentKind::MultiLineBlock),
+            ("\u{2029}", CommentKind::MultiLineBlock),
+            ("\n", CommentKind::MultiLineBlock),
+            ("\r", CommentKind::MultiLineBlock),
+            ("\r\n", CommentKind::MultiLineBlock),
+            ("", CommentKind::SingleLineBlock),
+            ("\u{2027}", CommentKind::SingleLineBlock),
+            ("\u{202a}", CommentKind::SingleLineBlock),
+            ("\u{00a0}", CommentKind::SingleLineBlock),
+        ] {
+            // A newline before the comment must not affect its kind.
+            for prefix in ["", "let a;", "let a;\n"] {
+                let source = format!("{prefix}/* first{separator}second */ let b;");
+                let comments = get_comments(&source);
+                assert_eq!(comments.len(), 1, "{source:?}");
+                assert_eq!(comments[0].kind, kind, "{source:?}");
+            }
+        }
     }
 
     #[test]
@@ -1052,9 +1220,9 @@ function bar() {}";
             ("/* webpackChunkName: 'my-chunk-name' */", CommentContent::Webpack),
             ("/* webpack */", CommentContent::None),
             ("/* @__PURE__ */", CommentContent::PureNotApplied),
-            ("/* @__NO_SIDE_EFFECTS__ */", CommentContent::NoSideEffects),
+            ("/* @__NO_SIDE_EFFECTS__ */", CommentContent::NoSideEffectsNotApplied),
             ("/* #__PURE__ */", CommentContent::PureNotApplied),
-            ("/* #__NO_SIDE_EFFECTS__ */", CommentContent::NoSideEffects),
+            ("/* #__NO_SIDE_EFFECTS__ */", CommentContent::NoSideEffectsNotApplied),
             ("/* @__KEY__ */", CommentContent::PropertyKey),
             ("/* #__KEY__ */", CommentContent::PropertyKey),
             ("/*\u{a0}@__KEY__\u{a0}*/", CommentContent::PropertyKey),
